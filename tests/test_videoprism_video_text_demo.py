@@ -54,3 +54,4 @@ def test_videoprism_video_text_demo_runs_on_cpu():
     assert "This is" in result.stdout, "Did not find expected completion message in output"
 
 
+

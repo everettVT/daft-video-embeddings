@@ -107,3 +107,7 @@ and adding the entire daft datatype return type hint at the end just looks terri
 
 Our new clips column sets us up to batch inference requests for higher throughput. It's pretty cool that the videoprism model already supports this, but we can stack our clips at inference time.
 
+This introduces another complexity, padding clip batches. If our video isn't easily divisible by our B*T Batch size, then we will have perform compile two forward functions. This is a worthwhile effort however and addresses the main two inference cases.
+
+- In an interesting turn of events, it doesn't really make sense to pass both text and video embeddings together with this model. Sending them seperately or together makes no difference on the output. The pipeline for a dataframe however is pretty different, so it's broken up. 
+
