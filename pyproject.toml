@@ -1,0 +1,23 @@
+[project]
+name = "daft-video-embeddings"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "daft>=0.6.1",
+    "numpy>=1.26",
+    "pillow",
+    "absl-py",
+    "einops",
+    "einshape",
+    "flax",
+    "sentencepiece",
+    "tensorflow==2.19.0",
+    "tensorboard==2.19.0",
+    "mediapy",
+    "jax",
+    "ipykernel",
+    "ipywidgets",
+]
+
