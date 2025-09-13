@@ -8,8 +8,8 @@ import tensorflow as tf
 from videoprism import models as vp
 
 
-@daft.func(return_dtype=dt.tensor(dt.float32()))
-def to_float01(img):
+@daft.func()
+def to_float01(img: np.ndarray) -> dt.tensor(dt.float32(), shape=(288, 288, 3)):
     arr = np.asarray(img, dtype=np.float32)
     return arr / 255.0
 
@@ -85,6 +85,7 @@ def main(paths: list[str], target_num_frames: int, text_queries: list[str] | Non
     # 1) Group frames into clips
     df_grouped = (
         df_tall
+        .with_column("group_index", col("frame_index") // target_num_frames)
         .groupby("path", "group_index")
         .agg_list("frame_index", "data_f32_01")
     )
