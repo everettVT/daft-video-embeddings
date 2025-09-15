@@ -111,3 +111,38 @@ This introduces another complexity, padding clip batches. If our video isn't eas
 
 - In an interesting turn of events, it doesn't really make sense to pass both text and video embeddings together with this model. Sending them seperately or together makes no difference on the output. The pipeline for a dataframe however is pretty different, so it's broken up. 
 
+### Jax compatibility and configuration
+
+You know considering the word jax doesn't even really appear on daft's documentation anywere, I was expecting to run into a lot more problems than I did.
+
+I got inference to work on a jitted inference function on both cpu and gpu, boasting some impresive batching throughput by stacking clips up to 24 deep on an A100. 
+
+I tried running it on the TPU, but it looks like the inference was trying to run all clips (the entire dataframe) at a time regardless of the batch size. I presume this is the caveat with how jax delegate compute to XLA.
+
+Even if I limited the dataframe to just 8 clips my session would crash. 
+
+2 rows works
+4 clips works
+8 clips work in 20 sec
+12 clips in 20 sec
+2 x 12 clips in 23 sec
+120 / 12 clips in 48 sec
+319 / 12 clips batch OOM in 148
+
+```error
+XlaRuntimeError: RESOURCE_EXHAUSTED: XLA:TPU compile permanent error. Ran out of memory in memory space hbm. Used 55.24G of 31.25G hbm. Exceeded hbm capacity by 23.99G.
+
+Total hbm usage >= 55.49G:
+    reserved        260.00M 
+    program          55.24G 
+    arguments            0B 
+
+Output size 0B; shares 0B with arguments.
+
+Program hbm requirement 55.24G:
+    global          260.02M
+    HLO temp         54.99G (100.0% utilization: Unpadded (54.70G) Padded (54.70G), 0.5% fragmentation (289.57M))
+```
+
+
+I was able to get my read_video_frames approach to work on

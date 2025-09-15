@@ -15,9 +15,10 @@ dependencies = [
     "sentencepiece",
     "tensorflow==2.19.0",
     "tensorboard==2.19.0",
-    "mediapy",
     "jax",
     "ipykernel",
     "ipywidgets",
+    "nemo_toolkit['asr']",
+    "av",
 ]
 
