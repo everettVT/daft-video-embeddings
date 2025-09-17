@@ -146,3 +146,111 @@ Program hbm requirement 55.24G:
 
 
 I was able to get my read_video_frames approach to work on
+
+
+
+
+# Parakeet
+
+i'm now trying to get parakeet to run. I used yt-dlp to download a few youtube videos from the deep dive playlist and I've preprocessed the audio into a list of numpy arrays... but I am getting an error saying 
+
+```python
+
+```
+
+
+
+```text
+ValueError: Input `audio` is of type <class 'daft.series.Series'>. Only `str` (path to audio file), `np.ndarray`, and `torch.Tensor` are supported as input.
+
+The above exception was the direct cause of the following exception:
+
+UDFException                              Traceback (most recent call last)
+/tmp/ipython-input-3135087487.py in <cell line: 0>()
+----> 1 df_transcribed = df_audio.with_column("text", ParakeetTranscribeUDF(df_audio["audio"])).collect()
+
+UDFException: User-defined function `<__main__.ParakeetTranscribeUDF object at 0x7f52bfdb48f0>` failed when executing on inputs:
+  - audio (Tensor(Float32), length=2)
+```
+
+
+
+# Working with the File Object
+
+My initial task working with `daft.File` was to read video file metadata. After attempting to disover the video duration or fps myself and running into multiple headaches with PyAv, I eventually gave up and asked GPT-5 which gave me a much longer answer than I was expecting. Apparently duration is not always something you can just read from the file header and you end up having to set a compute budget to calculate the duration from a stream. 
+
+The Metadata extraction function is exhaustive and goes way beyond the requested 4 attributes mentioned in the VideoType discussion, but it can be easily broken down. 
+
+I ran into my first friction point with daft.File when trying to pass the daft.File object as a path to the metadata probe function. At first, I tested to see if naively passing the daft.File itself would work, but I got a type error.
+
+```zsh 
+Cell In[9], line 44, in probe_video_header_with_pyav(path, probesize, analyzeduration_us)
+     39 audio_stream = next((s for s in container.streams if s.type == "audio"), None)
+     41 # General/container
+     42 meta: Dict[str, Any] = {
+     43     "path": path,
+---> 44     "name": os.path.basename(path),
+     45     "size_bytes": os.path.getsize(path),
+     46     "format_name": getattr(container.format, "name", None),
+     47     "format_long_name": getattr(container.format, "long_name", None),
+     48     "tags": dict(container.metadata or {}),
+     49     "bit_rate": getattr(container, "bit_rate", None),
+     50     "duration_seconds": _duration_seconds(container, video_stream),
+     51 }
+     53 # Video
+     54 if video_stream:
+
+File <frozen posixpath>:142, in basename(p)
+
+TypeError: expected str, bytes or os.PathLike object, not PathFile
+```
+
+This is a minor hurdle, and I didn't necessarily feel frustrated that it didn't work, so I tried passing in `str(daft.File)` and received a new error:
+
+```zsh
+Cell In[9], line 36, in probe_video_header_with_pyav(path, probesize, analyzeduration_us)
+     31 # Open read-only with constrained probe budgets
+     32 options = {
+     33     "probesize": str(probesize),
+     34     "analyzeduration": str(analyzeduration_us),
+     35 }
+---> 36 with av.open(path, mode="r", options=options, metadata_encoding="utf-8") as container:
+     37     # Choose the first video stream if present
+     38     video_stream = next((s for s in container.streams if s.type == "video"), None)
+     39     audio_stream = next((s for s in container.streams if s.type == "audio"), None)
+
+FileNotFoundError: [Errno 2] No such file or directory: 'File(file:///Users/everett/Movies/Running.mp4)'
+```
+
+This one was more confusing and frustrating because I wasn't sure how to just retrieve the original file path without just completely avoiding the `daft.File` class. Looking at the the class definition I see a `_from_path()` method but no `to_path` method. Additionally, I am personally unfamiliar with the *read, seek, tell* interface, so I had to look this up. It would be nice if there was a short description of what seek and tell means in the docstring of the methods.
+
+Once I learned what seek and tell were, this metadata reading problem became a lot more exciting. I now have the prospect of just grabbing the first frame directly? For this I needed to do some exploration. I got quickly confused, after trying to retrieve a container stream with `File.tell()` or `File.seek()` and defaulted back to gpt to return our core metadata details, which ended up working! I could spend time trying to make the function more daft native, but I'll let you guys do that. 
+
+COOL WE NOW HAVE CHEAP METADATA READING. Goal #1 of daft.DataType.video() accomplished! 
+
+Now for the hard part. 
+
+## Streaming
+
+We can extract image and video frames easily enough by reading the entire file, but streaming in a dataframe context is less intuitive. 
+
+Our goal is to read a batch of frames at a time for inference. Inference is almost always our bottleneck, so whatever we can pack into that job will define the rest of our pipeline. 
+
+I'll start with a generator pattern to yield batches of frames and iterate on a small subset until I OOM.
+
+I immediately ran into issues trying to yield values from a udf. In fact, the first time I tried it, the jupyter kernel crashed. I tried debugging the yield by replacing it with `return` but then I was running into issues with returning lists. I knew that was an issue I could solve, but there was something else bothering me. How would I capture results? The thought of concatenating datafrmes crossed my mind but that didn't sound like a viable approach.
+
+I then spent some time investigating a *seek* based strategy where I built a list of lists of frame indices (list of clips) and would convert those clips to the time_base format needed to seek to the desired frame. I got pretty much to the end of the implementation where I'd grab clips of frames and return a stacked numpy array but this felt wrong too.
+
+Lets say we proceeded with the seeking approach. Can we even open and stream a file more than once? 
+
+
+... oh shit that worked. How do I know if it's correct though? ... hold on.. never mind that. So I can seek and read chunks of a video in parallel... Thats what I just did. Before I was just reading the whole video in series and materializing the result. 
+
+If we are looking to keep the memory low, we will need fine tuned control over how rapidly we preprocess the videos. We don't want to just finish the job, we want to pipeline everything... I think this still works once its lazy, but I may need to change my row-wise udf to a batch udf to fully control batch size and concurrency. Pretty sure I'd have to do that. 
+
+So here's a question, if we don't have to worry about files locking up, then I think this preprocessing step has atomized our memory. I don't need to worry about pipe load balancing yet, lets just see how this ends up processing data.
+
+it would be good to return the full frame index with the numpy tensor, just to be sure. 
+
+Man, this is getting a little more exciting, its going to feel natural to attach the preprocessing to the inference udf as a pipeline.

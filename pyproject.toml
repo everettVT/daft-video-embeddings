@@ -19,6 +19,7 @@ dependencies = [
     "ipykernel",
     "ipywidgets",
     "nemo_toolkit['asr']",
+    "yt-dlp",
     "av",
 ]
 
