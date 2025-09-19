@@ -1,6 +1,46 @@
 # Video Embeddings
 
+Date: Aug 25, 2025
+Author: Everett Kleven
+Size: L
+Persona: UDF Naive User
+Notebooks:
+- from_video_frames to video embeddings
+- end to end video processing from file
 
+Scripts: 
+- 
+
+
+## Purpose
+
+Explore fricton points in processing video ai pipelines where it is prohibitive to load all frames into memory.
+
+
+## Summary
+
+Video processing is hard. My experience echoed similar pains to that of the [VideoType discussion](https://github.com/Eventual-Inc/Daft/discussions/5054), where `read_video_frames()` is convenient, but insufficient. For the naive use case of reading images to a row limit and generating video embeddings on 16 frame clips, I was able to get the happy path working within a few work sessions. Once I faced the prospect of video segmentation and leveraging seeking to concurrently read videos with daft.File things became overwhelming.
+
+What makes video processing particularly complex isn't just memory management, but the number of early decisions an engineer has to commit to when designing their workload. While my particular workload of video embeddings is straightforward, if I were building the pipeline for a more specific downstream task, I may implement things very differently.
+
+It can be overwhelming to consider the various permutations of video processing approaches, especially concerning ingestion and segmentation. Inference is where the problem becomes more concrete, but if you have multiple downstream AI/ML tasks with different batching requirements things can get hairy quickly. This leads us to wan't to canonicalize our preprocessing stages into a standard form that can then be repackaged and shaped downstream. 
+
+### Ingestion
+
+1. read_video_frames - which decodes video frames into images and stores them as rows against a frame index
+2. probe_video_metadata() + read_video_file(...,hist,sbd,audio) - which probes for metadata as a "cheap" pass, enabling early content filtering, then opening the video file with enriched inputs for extracting image histograms, shot boundary flag, and audio frames. Naturally the audio reading can be broken out into a seperate function entirely, but I'm including it here for brevity.
+3. probe_video_metadata() + seek_video_file(...,hist,sbd,audio) - same as above, except distribute reads reading each video file concurrently from pre-planned frame timestamps.
+
+### Segmentation 
+
+
+
+
+
+Each of these patterns approach handling segmentation, shotboundary 
+Segmentation in particular presents the problem or chunking your video into semantic pieces. While most downstream ai/ml tasks require samples in clips, usually on the order of 16 frame batches, any operation that occurs outside the clip context requires an additional groupby/explode. 
+Shot boundary detection and other video segmentation strategies incentivize early preprocessing during frame decoding at the file level. 
+File seeking can help parallelize reads, early computations like histograms and chi-squared distance are more convenient prior to dataframe ingestion. 
 
 # Notes
 
@@ -254,3 +294,33 @@ So here's a question, if we don't have to worry about files locking up, then I t
 it would be good to return the full frame index with the numpy tensor, just to be sure. 
 
 Man, this is getting a little more exciting, its going to feel natural to attach the preprocessing to the inference udf as a pipeline.
+
+This also means I will probably want to abstract the audioframe and video frame seeking 
+
+Friction Points in Video Processing Video processing fundamentally represents a different data processing paradigm due to a few specific things that almost all video processing pipelines do. I was able to get from daft.readvideoframes to video in prints with NumPy-stacked batches of clips of frames very quickly, within a few lines, a few transformations. The biggest headaches I ran into there were converting the image data type from its int8 representation and just having no documentation around it on how it is supposed to turn into an NDArray, a NumPy NDArray. But I was able to stack those frames into clips and then stack those clips into batches for inference, and then just whatever your compute can handle, you just load up the batch size, which for, you know, an A100, you could stack 24 clips of 16 frames each and get some solid performance. On a TPU, you couldn't get as many batches, but inference was probably a third of the time. But there's no concurrency with a TPU, and there wasn't really built-in support since it was running through jacks. But once you start to try to do, like, shot boundary detection and reading metadata and extracting audio as well as video frames, things start to get a lot airier, quickly. I was trying to run shot boundary detection using read video frames, and you run into this issue once you get to the actual shot boundary detection. So the traditional way of calculating this is with a histogram, and that's easy enough. That's a row-wise operation. But a shot boundary is fundamentally checking the previous frame against the next frame and doing some calculations to see if one is larger than the other, and then some thresholds. And the chi-squared distance needs to be changed enough for something. And then, you know, you're like, okay, how do I run this efficiently? Well, maybe the naive way to do it is that you group by... you do a modulus on the frame ID, divide it by two, and then you get this group ID. But then you're only checking really half of the samples for boundaries, so you've got to do it twice. And that's, like, you know, not great. Then the other idea is, you know, you try to pack it, you try to create these lists, you can do these group by lists. But then, you know, the thought occurs to you that, like, wait, couldn't I run this in batches in a batch UDF? You know, I'll have access to a series of frames. You know, I'll just sort it, and then I'll run it back and return. No, you can't do that. You can't sort inside of batch UDF. And this ends up becoming a problem, because you don't know when you perform batch inference whether or not you're actually getting a sequence of frames. You could perform a sort, but once you go distribute it, there's not a guarantee. And so that's why you have to do the group by. You do the group by, and then you assign the label of whether or not this is a shot boundary, and then you have to explode. But guess what? You have to do the exact same thing again if you're going to go and make your clips. So, like, guess what you do after you go and make your clips? You do your, you already did your group by to make your clips of 16 frames, and then inside your batch inference UDF, you can perform a stacking. It doesn't matter, because we're generating embeddings here. But even then, you're supposed to have spatial temporal metrics, right? So fundamentally, you're supposed to have this group by operation, and then if you want to go all the way back to frames, you have to explode again. And that's pretty normal. It's just that we're dealing with image frames, and that means that there's a decent amount of data. And the reality is, when we're reading frames from the file, that's the easiest time to do all of these calculations. We can pull the amount of data cheaply enough, but we can do all of these concurrent reads by seeking and creating a seek plan, and then pulling all of this data up again, right? Like, at the end of the day, you have to read all of the frames in the file. You do have to perform shot boundary detection on every pair of frames. And at the end of the day, it's just going to take as long as... Your ability to horizontally scale is about whether or not you're performing these operations in some sort of vectorized format, it's cheapest to do, especially like these histogram things, these conversions, as you're reading the frame, right? So, you know, it might be fine to just do the multiple group-bys and explode, group-by and explode, group-by and explode. You know, I'm sure you can process a lot of things a lot faster, especially since we're going to be throwing these numpy arrays into GPUs, right? But, like, especially for things like the shot boundary detection, it honestly makes a little bit more sense to do so when you are reading from the file. Otherwise, you have to do all these group-bys and explode. So, you know, supposedly, that's not a big deal. Until you start to think about what that looks like, you know, when you're shuffling, trying to get the sword, and all of the cool stuff. So, you know, I guess this is where maybe window functions would be more efficient. There are several different strategies here, but there's just a lot of pain, right? Like, you're not sure as you're developing this which one's the right way, and you're forced really, really early on to commit. And if you're trying to keep your memory footprint low, because you're throttled at inference, and you're hoping that your pipeline is just feeding you a steady stream of frames that you can then eventually pack into your inference, But, fundamentally, you will consistently run into this, you know, windowing problem. And, um, that's why Read Video Frames isn't as useful as it could be if it came with a few options to say, you know, also give me the audio, also give me the histogram, also give me these other things. Because, you know, we have to start with FFmpeg, and at the frame level there's all this data, and if you already have to decode it, you've already done the work. So, decide up front whether you just want to do that work, and do it. But, I think you can tell that there's these natural friction points that make video processing especially difficult. And, again, if we're talking about pipeline sizing, and we're talking about the different ways that we're batching this stuff, um, you know, and trying to minimize memory footprint because inference takes so much memory, um, and we don't just want to give our lives away to Redis, then, you know, we're going to be stuck.
+
+Just to add to the list, because I'm mostly just taking notes here. I did try a few different metadata reading approaches. I tried launching a subprocess inside of a UDF to read a file. Just to get the width and height. Frame rate, or frames per second. Then you want some keyframe data, right? Or you want something else. And I found that using PyAV with the open file as container pattern to be 10x faster. I think there's something to be said about that, where subprocess is probably just really slow inside of a UDF. And I think that makes sense. There's a whole host of metadata that we could read, but maybe we choose not to. And from what it sounds like, I'm covering my bases for the most part. But yeah, I thought that was important to include as well. I think that there's a couple approaches here. The full end-to-end workload that I'm trying to demonstrate is that we can take a directory of videos and we can read the video frames and the audio frames. We can generate embeddings from those audio frames and video frames. And then perform all these traditional WAG types of use cases against that. I think as much as I would love to fully demonstrate Q&A, I think the reality is that I don't have enough time. And I'll just generate the embeddings and demonstrate them. Q&A would be more useful. I'm already going to be doing transcription of audio. But there's these two different paradigms here as well. So reading image frames versus reading audio packets are not necessarily the same workload. It's not the same amount of data, but it's more data than your average image or text. And you might not need the same type of fashion strategy for audio as you do video. And you can potentially just do it separately. But technically, you would think that it would be the most efficient thing to read, to grab both the audio and the video at the same time. Simply because you have to decode the frame. So maybe that's not the case. Maybe you always want to read the audio differently. But when you're processing audio, there's a bunch of different sampling techniques. But at the end of the day, it's a little bit more memory bound. I don't know. Audio just isn't as prohibitively big as the image files can be. But I guess it can be much bigger. And technically, you're at a higher sampling rate. I don't know what actually ends up being the end. So I think there's several approaches here. There's this mega read where you take everything in a single pass. And naturally, it makes sense to break that up with metadata. And maybe it never makes sense to read both audio and video at the same time. It's just cheap enough to justify not having to do that. But if you're segmenting your audio and your video at the same levels, at the same frame indices, are you going to want to process them the same way? Especially if you're doing shot boundaries and textures. So in that case, I would say, yeah, you probably do want to segment at the shot boundary. But who knows? It might not be as important. I think it depends on the use case. But you just see how many different decisions you have to make. It can be overwhelming.
+
+---
+
+
+## Friction: Shot Boundary Detection (Histograms) + Streaming + Daft UDFs
+
+- Sorting before batch UDFs: For sequence algorithms (SBD), the row order in a group is not guaranteed. I must group by `path` and aggregate lists, then sort by `frame_index` inside the list-UDF. I cannot sort the DataFrame inside a UDF. This makes groupby+agg_list the default pattern for sequence ops.
+- Two-frame grouping is brittle: Bucketing into size-2 groups loses edges across bucket boundaries and forces extra filters. A per-path sequence pass computing adjacent diffs is cleaner and more accurate.
+- Streaming is cheaper: SBD is naturally streaming-friendly. Computing histograms and adjacent diffs while decoding avoids storing/sorting large per-frame lists. For now, a frame-level lead/lag join is a good relational compromise.
+- Keyframes are not semantic cuts: Relying on codec keyframes can miss true cuts or add false positives. Use them only to narrow refinement windows after a coarse pass.
+- Join-based alternative (no list sorting): Pre-sort by (`path`,`frame_index`), self-join current↔next rows, compute distances row-wise, then only group to assign contiguous `shot_id`s (or to enforce minimum shot length).
+- Minimum shot length: Needed to suppress flicker; parameterizing this in the SBD UDF is useful (e.g., 6–12 frames at working FPS).
+- UDF ergonomics:
+  - Type hints: returning `np.ndarray` in the signature isn’t supported; must declare `@daft.func(return_dtype=...)` explicitly.
+  - Bool dtype naming is inconsistent across examples (`dt.bool` vs `dt.bool_`). Minor paper-cut.
+  - Image dtype normalization: casting directly to `dt.tensor(dt.float32())` from image dtype fails; need an explicit UDF to `np.asarray(image).astype(np.float32)/255.0` first.
+  - Yield from UDF not supported; streaming has to return lists/structs or be done in a file-level UDF that returns aggregated results.
+- Aggregation naming: After `.agg_list("col")`, the resulting column is auto-suffixed (e.g., `col_agg`). Explicit `.alias(...)` is clearer.
+- Explode late: Keep data as grouped lists to stay vectorized; explode to per-clip rows only when feeding the model.
+- Warmup shapes: Model warmup needs known `(B,T,H,W,C)`. If baked into UDF `__init__`, these shapes must come from outer config; otherwise skip warmup to avoid lints.
+
+Actionables I’d like from Daft:
+- Clarify bool dtype naming, document list aggregation column names, and provide a simple lead/lag helper without joins.
+- Add a streaming-friendly example for video SBD (histograms + adjacent diffs) and a cookbook pattern for “detect shots → assign shot_id → window clips inside shots”.
