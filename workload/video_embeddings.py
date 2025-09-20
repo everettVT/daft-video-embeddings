@@ -74,6 +74,151 @@ def histogram(array: np.ndarray, bins: int = 256):
     return hist
 
 
+@daft.func(return_dtype=dt.list(dt.int64()))
+def detect_sbd_chi_squared_distance(
+    hists: list[np.ndarray], 
+    indices: list[int], 
+    pts: list[int],
+    threshold: float = 0.3, 
+    min_shot_duration: float = 0.5, # seconds
+    ) -> list[int]:
+
+    # Validate inputs
+    if len(hists) < 2:
+        return []
+
+    # Convert to numpy arrays
+    h_arr = [np.asarray(h, dtype=np.float32) for h in hists]
+    idx_arr = np.asarray(indices, dtype=np.int64)
+    pts_arr = np.asarray(pts, dtype=np.int64)
+
+    # Ensure monotonic increasing frame indices
+    order = np.argsort(idx_arr)
+    h_arr = [h_arr[i] for i in order]
+    idx_arr = idx_arr[order]
+    pts_arr = pts_arr[order]
+
+    # Chi-squared distance between consecutive frames (channel-averaged)
+    eps = 1e-8
+    dists = []
+    for i in range(1, len(h_arr)):
+        h1 = h_arr[i-1]
+        h2 = h_arr[i]
+        if h1.ndim == 1:
+            h1 = h1[None, :]
+        if h2.ndim == 1:
+            h2 = h2[None, :]
+        # Normalize per-channel to probabilities
+        h1n = h1 / (np.sum(h1, axis=1, keepdims=True) + eps)
+        h2n = h2 / (np.sum(h2, axis=1, keepdims=True) + eps)
+        num = (h1n - h2n) ** 2
+        den = h1n + h2n + eps
+        chisq_per_channel = 0.5 * np.sum(num / den, axis=1)
+        d = float(np.mean(chisq_per_channel))
+        dists.append(d)
+    dists = np.asarray(dists, dtype=np.float32)  # length N-1, aligned to transition into frame i
+    smoothed = dists
+
+    # Threshold with minimum shot duration constraint
+    min_us = int(min_shot_duration * 1_000_000.0)
+    boundaries: list[int] = []
+    last_boundary_pts = None
+
+    # dists[i-1] corresponds to transition between frames (i-1)->i; use frame i's index/time
+    for i in range(1, len(idx_arr)):
+        if smoothed[i-1] > threshold:
+            cand_pts = int(pts_arr[i])
+            if last_boundary_pts is None or (cand_pts - last_boundary_pts) >= min_us:
+                boundaries.append(int(idx_arr[i]))
+                last_boundary_pts = cand_pts
+
+    return boundaries
+
+@daft.func(return_dtype=dt.list(dt.int64()))
+def detect_sbd_chi_squared_hysteresis(
+    hists: list[np.ndarray],
+    indices: list[int],
+    pts: list[int],
+    high_threshold: float = 0.4,
+    low_threshold: float = 0.25,
+    min_shot_duration: float = 0.5,  # seconds
+    ) -> list[int]:
+
+    if len(hists) < 2:
+        return []
+
+    # Validate thresholds
+    if not (low_threshold < high_threshold):
+        # Swap to enforce proper ordering if misconfigured
+        low_threshold, high_threshold = min(low_threshold, high_threshold), max(low_threshold, high_threshold)
+
+    # Convert and sort by frame index
+    h_arr = [np.asarray(h, dtype=np.float32) for h in hists]
+    idx_arr = np.asarray(indices, dtype=np.int64)
+    pts_arr = np.asarray(pts, dtype=np.int64)
+    order = np.argsort(idx_arr)
+    h_arr = [h_arr[i] for i in order]
+    idx_arr = idx_arr[order]
+    pts_arr = pts_arr[order]
+
+    # Compute per-transition chi-squared distances
+    eps = 1e-8
+    dists = []
+    for i in range(1, len(h_arr)):
+        h1 = h_arr[i-1]
+        h2 = h_arr[i]
+        if h1.ndim == 1:
+            h1 = h1[None, :]
+        if h2.ndim == 1:
+            h2 = h2[None, :]
+        h1n = h1 / (np.sum(h1, axis=1, keepdims=True) + eps)
+        h2n = h2 / (np.sum(h2, axis=1, keepdims=True) + eps)
+        num = (h1n - h2n) ** 2
+        den = h1n + h2n + eps
+        chisq_per_channel = 0.5 * np.sum(num / den, axis=1)
+        d = float(np.mean(chisq_per_channel))
+        dists.append(d)
+    dists = np.asarray(dists, dtype=np.float32)
+
+    # Hysteresis scan: choose the local peak within a high-threshold crossing, end when below low-threshold
+    boundaries: list[int] = []
+    min_us = int(min_shot_duration * 1_000_000.0)
+    last_boundary_pts = None
+
+    inside_cluster = False
+    peak_dist = -1.0
+    peak_i = -1
+
+    for i in range(1, len(idx_arr)):
+        d = dists[i-1]
+        if not inside_cluster:
+            if d >= high_threshold:
+                inside_cluster = True
+                peak_dist = d
+                peak_i = i
+        else:
+            # Track peak while in cluster
+            if d > peak_dist:
+                peak_dist = d
+                peak_i = i
+            # Exit when we drop below low threshold; commit the peak as boundary
+            if d <= low_threshold:
+                cand_pts = int(pts_arr[peak_i])
+                if last_boundary_pts is None or (cand_pts - last_boundary_pts) >= min_us:
+                    boundaries.append(int(idx_arr[peak_i]))
+                    last_boundary_pts = cand_pts
+                inside_cluster = False
+                peak_dist = -1.0
+                peak_i = -1
+
+    # If we ended still inside a cluster, commit the peak
+    if inside_cluster and peak_i >= 0:
+        cand_pts = int(pts_arr[peak_i])
+        if last_boundary_pts is None or (cand_pts - last_boundary_pts) >= min_us:
+            boundaries.append(int(idx_arr[peak_i]))
+
+    return boundaries
+
 def detect_shot_boundaries(h1: np.ndarray, h2: np.ndarray, threshold: float = 0.3) -> bool:
     # Chi-square distance over channel-wise normalized histograms
 
@@ -163,7 +308,32 @@ def main(
     df_hist.show()
 
     # Detect Shot Boundaries
-    df_sbd = df_hist.with_column("")
+    df_sbd = (
+        df_hist
+        .groupby("path").agg_list("histogram", "frame_index", "frame_pts")
+        .with_column(
+            "shot_boundaries",
+            detect_sbd_chi_squared_distance(
+                col("histogram"),
+                col("frame_index"),
+                col("frame_pts"),
+                threshold=0.3,
+                min_shot_duration=0.5,
+            ),
+        )
+        .with_column(
+            "shot_boundaries_hyst",
+            detect_sbd_chi_squared_hysteresis(
+                col("histogram"),
+                col("frame_index"),
+                col("frame_pts"),
+                high_threshold=0.4,
+                low_threshold=0.25,
+                min_shot_duration=0.5,
+            ),
+        )
+    )
+    df_sbd.show()
 
     # Stack Images into Clipss
     df = (

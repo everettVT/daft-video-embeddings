@@ -1,21 +1,18 @@
 import daft
 from daft import col, DataType as dt
 from daft.functions import file
+from daft.io.av._read_video_frames import _VideoFrame
 import av
 from av.audio.resampler import AudioResampler
 import time
 import numpy as np
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+from typing_extensions import TypeAlias
 
-
-
-def frame_to_rgb_float32(frame: av.VideoFrame, w: int, h: int, interp: str = None) -> np.ndarray:
-    """Convert an AV frame to a normalized RGB float32 array."""
-    return frame.to_ndarray(
-        width=w,
-        height=h,
-        format="rgb24",
-        interpolation=interp,
-    ).astype(np.float32) / 255.0
+if TYPE_CHECKING:
+    from fractions import Fraction
+    _VideoFrameData: TypeAlias = np.typing.NDArray[Any]
 
 
 @daft.func(return_dtype = dt.struct({
@@ -28,7 +25,7 @@ def frame_to_rgb_float32(frame: av.VideoFrame, w: int, h: int, interp: str = Non
     "keyframe_pts": dt.list(dt.float64()),
     "keyframe_indices": dt.list(dt.int32()),
 }))
-def get_video_metadata(
+def fetch_video_metadata(
     file: daft.File,
     *,
     probesize: str = "64k",
@@ -117,135 +114,57 @@ def get_video_metadata(
             "keyframe_indices": keyframe_indices,
         }
 
+@dataclass
+class _MultiStreamVideoFrame:
+    """Represents a single video frame.
 
-
-@daft.func(return_dtype=dt.list(dt.float64()))
-def make_uniform_clip_starts(
-    fps: float,
-    duration: float,
-    T: int,
-    stride_frames: int | None = None,
-) -> list[float]:
-    """Create time-based start seconds for fixed-length T-frame clips.
-
-    - Uses stream fps and duration to produce deterministic starts: t = k * (stride_frames/fps)
-    - Each clip spans clip_dur_sec = T / fps, so we keep starts while t + clip_dur_sec <= duration.
+    Note:
+        The field name 'data' is required due to a casting bug.
+        See: https://github.com/Eventual-Inc/Daft/issues/4872
     """
-    if fps is None or duration is None or fps <= 0 or duration <= 0 or T <= 0:
-        return []
-    if stride_frames is None or stride_frames <= 0:
-        stride_frames = T
-    stride_sec = stride_frames / float(fps)
-    clip_dur_sec = T / float(fps)
-    starts: list[float] = []
-    t = 0.0
-    eps = 1e-6
-    while t + clip_dur_sec <= duration + eps:
-        starts.append(float(t))
-        t += stride_sec
-    return starts
 
+    path: str
+    stream_index: int
+    frame_time_ns: int
+    frame_time: float
+    frame_time_base: Fraction
+    frame_pts: int
+    frame_dts: int | None
+    frame_duration: int | None
+    is_key_frame: bool
+    data: _VideoFrameData
+
+def select_stream_by_index(container: av.container.input.InputContainer, stream_index: int) -> av.video.stream.VideoStream:
+    vs = container.streams.video[stream_index]
+    if getattr(vs.disposition, "attached_pic", False):
+        raise ValueError("Selected stream is an attached picture/thumbnail.")
+    return vs
+
+def pts_time_ns(pts: int | None, time_base: Fraction) -> int | None:
+    if pts is None:
+        return None
+    # exact integer nanoseconds without float rounding
+    return (pts * time_base.numerator * 1_000_000_000) // time_base.denominator
 
 
 @daft.func(return_dtype=dt.struct({
-    "start_sec": dt.float64(),
-    "end_sec": dt.float64(),
-    "start_frame": dt.int32(),
-    "end_frame": dt.int32(),
-    "is_keyframe_start": dt.bool(),
+    "stream_index": dt.int32(),
+    "frame_index": dt.int32(),
+    "frame_time": dt.float64(),
+    "frame_time_base": dt.string(),
+    "frame_pts": dt.float64(),
+    "frame_dts": dt.float64(),
+    "frame_duration": dt.float64(),
+    "is_key_frame": dt.bool(),
+    "data": dt.image(mode="RGB")
 }))
-def plan_clip_seek(
-    keyframe_pts: list[float],
-    keyframe_indices: list[int],
-    fps: float,
-    clip_duration: float = 2.0,
-    max_clips: int = None,
-) -> list[dict]:
-    """
-    Plan clip extraction using keyframe information.
-    
-    Returns a list of clip plans, each specifying:
-    - start_sec: start time in seconds
-    - end_sec: end time in seconds  
-    - start_frame: start frame index
-    - end_frame: end frame index
-    - is_keyframe_start: whether clip starts on a keyframe
-    
-    Parameters
-    ----------
-    keyframe_pts : list[float]
-        Keyframe timestamps in seconds
-    keyframe_indices : list[int]
-        Keyframe frame indices
-    fps : float
-        Frames per second
-    clip_duration : float, default 2.0
-        Duration of each clip in seconds
-    max_clips : int, optional
-        Maximum number of clips to return
-    """
-    if not keyframe_pts or not keyframe_indices or fps is None or fps <= 0:
-        return []
-    
-    clips = []
-    clip_frames = int(round(clip_duration * fps))
-    
-    # Generate clips starting from each keyframe
-    for i, (kf_sec, kf_frame) in enumerate(zip(keyframe_pts, keyframe_indices)):
-        start_sec = kf_sec
-        end_sec = start_sec + clip_duration
-        start_frame = kf_frame
-        end_frame = start_frame + clip_frames
-        
-        clips.append({
-            "start_sec": start_sec,
-            "end_sec": end_sec,
-            "start_frame": start_frame,
-            "end_frame": end_frame,
-            "is_keyframe_start": True,
-        })
-    
-    # Also generate clips between keyframes if there are gaps
-    for i in range(len(keyframe_pts) - 1):
-        kf_sec = keyframe_pts[i]
-        next_kf_sec = keyframe_pts[i + 1]
-        
-        # Skip if gap is smaller than clip duration
-        if next_kf_sec - kf_sec <= clip_duration:
-            continue
-            
-        # Generate intermediate clips
-        current_sec = kf_sec + clip_duration
-        while current_sec + clip_duration <= next_kf_sec:
-            start_frame = int(round(current_sec * fps))
-            end_frame = start_frame + clip_frames
-            
-            clips.append({
-                "start_sec": current_sec,
-                "end_sec": current_sec + clip_duration,
-                "start_frame": start_frame,
-                "end_frame": end_frame,
-                "is_keyframe_start": False,
-            })
-            current_sec += clip_duration
-    
-    # Sort by start time
-    clips.sort(key=lambda x: x["start_sec"])
-    
-    # Limit number of clips if requested
-    if max_clips is not None:
-        clips = clips[:max_clips]
-    
-    return clips
-
-
-
-def seek_video_frames(
+def seek_multistream_video_frames(
     file: daft.File, 
     start_sec: float,
+    end_sec: float,
+    stream_indices: list[int] = None,
     probesize: str = "64k",
     analyzeduration_us: int = 200_000,
-    num_frames: int = 16, 
     width: int = 288, 
     height: int = 288, 
     interp: str = None
@@ -257,91 +176,70 @@ def seek_video_frames(
     }
 
     with av.open(file, mode="r", options=options, metadata_encoding="utf-8") as container:
-        vs = container.streams.video[0]
-        vs.thread_type = "AUTO"
+        # Select streams
+        if stream_indices is None:
+            streams = [s for s in container.streams.video if not getattr(s.disposition, "attached_pic", False)]
+        else:
+            streams = [container.streams.video[i] for i in stream_indices]
+            streams = [s for s in streams if not getattr(s.disposition, "attached_pic", False)]
 
-        # 1) Compute seek offset in stream ticks
-        ts = int(start_sec / float(vs.time_base))  # seconds -> ticks
+        if not streams:
+            return
 
-        # 2) Seek to keyframe <= start_sec
-        container.seek(ts, stream=vs, any_frame=False, backward=True)
-
-        # 3) New decode loop; drop until PTS >= start_sec
-        out = np.empty((num_frames, height, width, 3), dtype=np.float32)
-        got = 0
-        target = start_sec
+        for s in streams:
+            s.thread_type = "AUTO"
+        
+        # Seek each stream to the start; use the first stream as the anchor
+        anchor = streams[0]
+        ts = int(start_sec / float(anchor.time_base))
+        container.seek(ts, stream=anchor, any_frame=False, backward=True) # jump to the start
+        
+        # Per-stream bookkeeping
+        end_pts_by_stream = {s.index: int(end_sec / float(s.time_base)) for s in streams}
+        ended_streams = set()
         eps = 1e-6
 
-        for frame in container.decode(video=0):
-            if frame.pts is None:
+        for packet in container.demux(streams):
+            if packet.stream.type != "video":
                 continue
-            t = frame.pts * float(vs.time_base)
-            if t + eps < target:
-                continue  # not reached start yet
 
-            # 4) Collect frames
-            arr = frame_to_rgb_float32(frame, w=width, h=height, interp=interp)
-            out[got] = arr
-            got += 1
-            if got == num_frames:
-                break
+            for frame in packet.decode():
+                vs = frame.stream  # the owning stream
+                sidx = vs.index
 
-        # If fewer than requested frames exist, trim
-        if got < num_frames:
-            # Pad by repeating last available frame for deterministic shape
-            if got == 0:
-                return np.zeros((0, height, width, 3), dtype=np.float32)
-            last = out[got - 1]
-            for i in range(got, num_frames):
-                out[i] = last
-        return out
+                if frame.pts is None:
+                    continue
 
+                # Cut by start
+                t = frame.pts * float(vs.time_base)
+                if t + eps < start_sec:
+                    continue
 
+                # Cut by end (per-stream). Mark stream ended but keep demuxing others.
+                if frame.pts > end_pts_by_stream[sidx]:
+                    ended_streams.add(sidx)
+                    if len(ended_streams) == len(streams):
+                        return
+                    continue
 
+                f = frame
+                if width and height:
+                    f = f.reformat(width=width, height=height, interp=interp)
 
-@daft.func()
-def extract_audio_clips(file: daft.File, start_sec: float, end_sec: float, num_frames: int = 16, ) -> np.ndarray:
+                yield _MultiStreamVideoFrame(
+                    path=str(file),
+                    stream_index=sidx,
+                    frame_time_ns=pts_time_ns(f.pts, f.time_base),
+                    frame_time=f.time,
+                    frame_time_base=f.time_base,
+                    frame_pts=f.pts,
+                    frame_dts=f.dts,
+                    frame_duration=f.duration,
+                    is_key_frame=f.key_frame,
+                    data=f.to_ndarray(format="rgb24"),
+                )
 
-    container = av.open(file)
-    resampler = AudioResampler(format='s16', layout='mono', rate=16000)
-
-    chunks = []
-    try:
-        for frame in container.decode(audio=0):
-            # Resample to desired SR/mono/PCM16; result can be a frame or list of frames
-            res = resampler.resample(frame)
-            frames = res if isinstance(res, (list, tuple)) else [res]
-
-            for f in frames:
-                arr = f.to_ndarray()  # typically (channels, samples) or (samples,)
-
-                # Flatten to 1-D mono
-                if arr.ndim == 2:
-                    # (1, N) or (N, 1) → (N,)
-                    if arr.shape[0] == 1:
-                        arr = arr[0]
-                    elif arr.shape[1] == 1:
-                        arr = arr[:, 0]
-                    else:
-                        # Unexpected multi-channel after mono resample: average as fallback
-                        arr = arr.mean(axis=0)
-                elif arr.ndim > 2:
-                    arr = arr.reshape(-1)
-
-                # Convert PCM16 → float32 in [-1, 1]
-                if arr.dtype != np.float32:
-                    arr = (arr.astype(np.float32) / 32768.0).clip(-1.0, 1.0)
-
-                chunks.append(arr)
-    finally:
-        container.close()
-
-    if not chunks:
-        return np.zeros((0,), dtype=np.float32)
-
-    audio = np.concatenate(chunks, axis=0).astype(np.float32, copy=False)
-    return audio
-
+            
 
 def main(uri: str, row_limit: int,B: int, T: int, W: int, H: int, interp: str = None):
     start = time.time()

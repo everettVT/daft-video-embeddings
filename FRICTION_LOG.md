@@ -14,31 +14,27 @@ Scripts:
 
 ## Purpose
 
-Explore fricton points in processing video ai pipelines where it is prohibitive to load all frames into memory.
+Explore friction points in video ai pipelines assuming it is prohibitive to load all frames into memory.
 
 
 ## Summary
 
-Video processing is hard. My experience echoed similar pains to that of the [VideoType discussion](https://github.com/Eventual-Inc/Daft/discussions/5054), where `read_video_frames()` is convenient, but insufficient. For the naive use case of reading images to a row limit and generating video embeddings on 16 frame clips, I was able to get the happy path working within a few work sessions. Once I faced the prospect of video segmentation and leveraging seeking to concurrently read videos with daft.File things became overwhelming.
+Video processing is hard. My experience echoed similar pains to that of the [VideoType discussion](https://github.com/Eventual-Inc/Daft/discussions/5054), where `read_video_frames()` is convenient, but insufficient. For the naive use case of reading images to a row limit and generating video embeddings on 16 frame clips, I was able to get the happy path working within a few work sessions. Once I faced the prospect of video segmentation and seeking to concurrently read videos with daft.File things became much more complicated.
 
 What makes video processing particularly complex isn't just memory management, but the number of early decisions an engineer has to commit to when designing their workload. While my particular workload of video embeddings is straightforward, if I were building the pipeline for a more specific downstream task, I may implement things very differently.
 
 It can be overwhelming to consider the various permutations of video processing approaches, especially concerning ingestion and segmentation. Inference is where the problem becomes more concrete, but if you have multiple downstream AI/ML tasks with different batching requirements things can get hairy quickly. This leads us to wan't to canonicalize our preprocessing stages into a standard form that can then be repackaged and shaped downstream. 
 
-### Ingestion
+### Ingestion 
 
 1. read_video_frames - which decodes video frames into images and stores them as rows against a frame index
 2. probe_video_metadata() + read_video_file(...,hist,sbd,audio) - which probes for metadata as a "cheap" pass, enabling early content filtering, then opening the video file with enriched inputs for extracting image histograms, shot boundary flag, and audio frames. Naturally the audio reading can be broken out into a seperate function entirely, but I'm including it here for brevity.
 3. probe_video_metadata() + seek_video_file(...,hist,sbd,audio) - same as above, except distribute reads reading each video file concurrently from pre-planned frame timestamps.
 
-### Segmentation 
+### Segementation - Clips & Shot Boundary Detection 
 
+Segmentation in particular presents the problem or chunking your video into semantic pieces. Most downstream ai/ml tasks require samples in clips, usually on the order of 16 frame batches, any operation that occurs outside the clip context requires an additional groupby/explode.
 
-
-
-
-Each of these patterns approach handling segmentation, shotboundary 
-Segmentation in particular presents the problem or chunking your video into semantic pieces. While most downstream ai/ml tasks require samples in clips, usually on the order of 16 frame batches, any operation that occurs outside the clip context requires an additional groupby/explode. 
 Shot boundary detection and other video segmentation strategies incentivize early preprocessing during frame decoding at the file level. 
 File seeking can help parallelize reads, early computations like histograms and chi-squared distance are more convenient prior to dataframe ingestion. 
 
