@@ -21,5 +21,6 @@ dependencies = [
     "nemo_toolkit['asr']",
     "yt-dlp",
     "av",
+    "pytest>=8.4.2",
 ]
 

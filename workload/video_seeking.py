@@ -1,18 +1,14 @@
 import daft
 from daft import col, DataType as dt
 from daft.functions import file
-from daft.io.av._read_video_frames import _VideoFrame
 import av
-from av.audio.resampler import AudioResampler
 import time
 import numpy as np
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
-from typing_extensions import TypeAlias
+from fractions import Fraction
 
-if TYPE_CHECKING:
-    from fractions import Fraction
-    _VideoFrameData: TypeAlias = np.typing.NDArray[Any]
+
+
 
 
 @daft.func(return_dtype = dt.struct({
@@ -132,7 +128,7 @@ class _MultiStreamVideoFrame:
     frame_dts: int | None
     frame_duration: int | None
     is_key_frame: bool
-    data: _VideoFrameData
+    data: np.ndarray
 
 def select_stream_by_index(container: av.container.input.InputContainer, stream_index: int) -> av.video.stream.VideoStream:
     vs = container.streams.video[stream_index]
@@ -146,152 +142,193 @@ def pts_time_ns(pts: int | None, time_base: Fraction) -> int | None:
     # exact integer nanoseconds without float rounding
     return (pts * time_base.numerator * 1_000_000_000) // time_base.denominator
 
+def safe_decode_packet(packet: av.packet.Packet) -> list[av.video.frame.VideoFrame]:
+    try:
+        return packet.decode()
+    except av.AVError:
+        return []
+    except Exception:
+        return []
+         
 
-@daft.func(return_dtype=dt.struct({
-    "stream_index": dt.int32(),
-    "frame_index": dt.int32(),
-    "frame_time": dt.float64(),
-    "frame_time_base": dt.string(),
-    "frame_pts": dt.float64(),
-    "frame_dts": dt.float64(),
-    "frame_duration": dt.float64(),
-    "is_key_frame": dt.bool(),
-    "data": dt.image(mode="RGB")
-}))
-def seek_multistream_video_frames(
-    file: daft.File, 
-    start_sec: float,
-    end_sec: float,
-    stream_indices: list[int] = None,
+@daft.func(
+    return_dtype=
+        dt.struct(
+            {
+                "path": dt.string(),
+                "stream_index": dt.int32(),
+                "frame_time": dt.float64(),
+                "frame_time_base": dt.string(),
+                "frame_time_ns": dt.int64(),
+                "frame_pts": dt.float64(),
+                "frame_dts": dt.float64(),
+                "frame_duration": dt.float64(),
+                "is_key_frame": dt.bool(),
+                "data": dt.binary(),  # stores RGB bytes (H x W x 3)
+            }
+        )
+)
+def seek_video_frames(
+    file: daft.File,
+    *,
+    start_sec: float = 0.0,
+    end_sec: float = float("inf"),
     probesize: str = "64k",
     analyzeduration_us: int = 200_000,
     width: int = 288, 
     height: int = 288, 
-    interp: str = None
     ):
     
     options = {
         "probesize": str(probesize),
         "analyzeduration": str(analyzeduration_us),
     }
-
+    eps = 1e-6
     with av.open(file, mode="r", options=options, metadata_encoding="utf-8") as container:
-        # Select streams
-        if stream_indices is None:
-            streams = [s for s in container.streams.video if not getattr(s.disposition, "attached_pic", False)]
-        else:
-            streams = [container.streams.video[i] for i in stream_indices]
-            streams = [s for s in streams if not getattr(s.disposition, "attached_pic", False)]
+        # Select video streams (exclude attached thumbnails)
+        vs = next((s for s in container.streams if s.type == "video"), None)
+        vs.thread_type = "AUTO"
 
-        if not streams:
-            return
+        # Compute seek position and optional end bound in this stream's ticks
+        ts_start = int(start_sec / float(vs.time_base)) if start_sec > 0 else 0
+        end_pts = None if end_sec == float("inf") else int(end_sec / float(vs.time_base))
 
-        for s in streams:
-            s.thread_type = "AUTO"
-        
-        # Seek each stream to the start; use the first stream as the anchor
-        anchor = streams[0]
-        ts = int(start_sec / float(anchor.time_base))
-        container.seek(ts, stream=anchor, any_frame=False, backward=True) # jump to the start
-        
-        # Per-stream bookkeeping
-        end_pts_by_stream = {s.index: int(end_sec / float(s.time_base)) for s in streams}
-        ended_streams = set()
-        eps = 1e-6
+        container.seek(ts_start, stream=vs, any_frame=False, backward=True)
 
-        for packet in container.demux(streams):
-            if packet.stream.type != "video":
+
+        # Decode frames only from this stream
+        for frame in container.decode(vs):
+            if frame.pts is None:
                 continue
 
-            for frame in packet.decode():
-                vs = frame.stream  # the owning stream
-                sidx = vs.index
+            t = frame.pts * float(vs.time_base)
+            if t + eps < start_sec:
+                continue
+            if end_pts is not None and frame.pts > end_pts:
+                break
 
-                if frame.pts is None:
-                    continue
+            # Resize & convert
+            if width and height:
+                frame = frame.reformat(width=width, height=height)
 
-                # Cut by start
-                t = frame.pts * float(vs.time_base)
-                if t + eps < start_sec:
-                    continue
+            yield {
+                "path": str(file),
+                "stream_index": int(vs.index),
+                "frame_time": float(frame.time),
+                "frame_time_base": str(frame.time_base),
+                "frame_time_ns": pts_time_ns(frame.pts, frame.time_base),
+                "frame_pts": float(frame.pts),
+                "frame_dts": float(frame.dts) if frame.dts is not None else float("nan"),
+                "frame_duration": float(frame.duration) if frame.duration is not None else float("nan"),
+                "is_key_frame": bool(frame.key_frame),
+                "data": frame.to_ndarray(format="rgb24").tobytes(),
+            }
 
-                # Cut by end (per-stream). Mark stream ended but keep demuxing others.
-                if frame.pts > end_pts_by_stream[sidx]:
-                    ended_streams.add(sidx)
-                    if len(ended_streams) == len(streams):
-                        return
-                    continue
 
-                f = frame
-                if width and height:
-                    f = f.reformat(width=width, height=height, interp=interp)
+@daft.func(return_dtype=dt.struct({
+    "path": dt.string(),
+    "frame_time": dt.int32(),
+    "tensor": dt.binary(),
+}))
+def fake_yield_frames(file: daft.File):
+    for i in range(16):
+        arr = np.zeros((288, 288, 3), dtype=np.float32)
+        return {
+            "path":str(file),
+            "frame_time": i,
+            "tensor": arr.tobytes(),
+        }
 
-                yield _MultiStreamVideoFrame(
-                    path=str(file),
-                    stream_index=sidx,
-                    frame_time_ns=pts_time_ns(f.pts, f.time_base),
-                    frame_time=f.time,
-                    frame_time_base=f.time_base,
-                    frame_pts=f.pts,
-                    frame_dts=f.dts,
-                    frame_duration=f.duration,
-                    is_key_frame=f.key_frame,
-                    data=f.to_ndarray(format="rgb24"),
-                )
 
-            
+@daft.func(return_dtype=dt.list(dt.float64()))
+def linspace(start: float, end: float, num: int):
+    step = (end - start) / (num - 1)
+    return [start + i * step for i in range(int(num))]
 
-def main(uri: str, row_limit: int,B: int, T: int, W: int, H: int, interp: str = None):
+
+def main(uri: str, seek_duration: float, num_batches: int, B: int, T: int, W: int, H: int):
     start = time.time()
 
+    for i in range(num_batches):
+        df = (
+            daft.from_glob_path(uri)
+            .with_column("file", file(col("path")))
+            .with_column("meta", fetch_video_metadata(col("file")))
+            .with_column("duration", col("meta")["duration"])
+            .with_column("starts", 
+                linspace(0.0, col("meta")["duration"], col("meta")["duration"]//max_video_seek_read_duration)
+            ).explode("starts")
+            .with_column("frames",
+                seek_video_frames(
+                    col("file"),
+                    start_sec=col("starts"),
+                    end_sec=col("starts") + max_video_seek_read_duration,
+                    width=W,
+                    height=H,
+                )
+            )
+        )
+        batches = df.iter_batches(batch_size=B)
+        
+
+if __name__ == "__main__":
+    uri = "../videoprism/videoprism/assets/*.mp4"
+    B, T, H, W, C = 2, 16, 288, 288, 3 # Batch Size, Clip Size (# frames), Height, Width, RGB
+    ROW_LIMIT = 500
+    eager = True
+    interp = None
+    max_video_seek_read_duration = 10.0 # How wide of a batch to read from the video at a time
+
+    start = time.time()
+
+    
     # Files → Metadata
     df_files = (
         daft.from_glob_path(uri)
         .with_column("file", file(col("path")))
-        .where(col("path").str.endswith(".mp4"))
     )
-    df_meta = df_files.with_column("meta", get_video_metadata(col("file")))
+    
 
-    # Time-based plan: uniform starts at target fps buckets (stride=T frames)
-    df_plan = (
-        df_meta
-        .with_column(
-            "starts",
-            make_uniform_clip_starts(
-                col("meta")["fps"],
-                col("meta")["duration"],
-                T,
-                stride_frames=T,
-            ),
-        )
-        .explode("starts")
-        .with_column("start_sec", col("starts"))
-        .drop("starts")
-    )
+    df_meta = df_files.with_column("meta", fetch_video_metadata(col("file")))
+   
 
-    # Deterministic seek + decode per planned start
-    df_clips = df_plan.with_column(
-        "clip",
+    df_ugh = df_meta.with_column("duration", col("meta")["duration"])
+
+
+    df_seek_plan = df_meta.with_column("starts", 
+        linspace(0.0, col("meta")["duration"], col("meta")["duration"]//max_video_seek_read_duration)
+    ).explode("starts")
+
+    df_clips = df_seek_plan.with_column("frames",
         seek_video_frames(
             col("file"),
-            col("start_sec"),
-            num_frames=T,
+            start_sec=col("starts"),
+            end_sec=col("starts") + max_video_seek_read_duration,
             width=W,
             height=H,
-            interp=interp,
-        ),
+        )
+    ).limit(ROW_LIMIT)
+
+
+    # Unpack metadata struct into individual columns
+    df_final = df_clips.select(
+        col("path"),
+        col("meta")["width"].alias("width"),
+        col("meta.height").alias("height"),
+        col("meta")["fps"].alias("fps"),
+        col("meta")["duration"].alias("duration"),
+        col("meta")["frame_count"].alias("frame_count"),
+        col("meta")["time_base"].alias("time_base"),
+        col("meta")["keyframe_pts"].alias("keyframe_pts"),
+        col("meta")["keyframe_indices"].alias("keyframe_indices"),
+        col("frames")["stream_index"].alias("stream_index"),
+        col("frames")["frame_time"].alias("frame_time"),
+        col("frames")["data"].image.decode(daft.ImageMode.RGB).alias("image"),
+
     )
 
-    # Optional: preview limited rows
-    _ = df_clips.limit(row_limit).collect()
-    print(f"Time taken: {time.time() - start} seconds")
-    return df_clips
+
+    print(f"Time taken: {time.time() - start:.2f}s")
 
 
-
-if __name__ == "__main__":
-    uri = "../videoprism/videoprism/assets/*.mp4"
-    df = main(uri, row_limit=10, B=2, T=16, W=288, H=288, interp=None)
-
-
-   
+    df_clips.show()
