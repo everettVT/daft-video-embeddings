@@ -18,8 +18,6 @@ def frame_to_rgb_float32(frame: av.VideoFrame, w: int, h: int, interp: str = Non
         interpolation=interp,
     ).astype(np.float32) / 255.0
 
-def frame_to_daft_image(frame: av.VideoFrame) -> daft.Image:
-    return daft.Image.from_numpy(frame.to_ndarray(format="rgb24"))
 
 ## Probe Metadata ----------------------------------- 
 
@@ -313,68 +311,6 @@ def seek_video_frames(
 
 
 
-@daft.func()
-def seek_audio_frames(file: daft.File, start_sec: float, end_sec: float, num_frames: int = 16, ) -> np.ndarray:
-
-    # Check mime_type is audio
-    if file.mime_type != "audio/mp4":
-        raise ValueError("File is not an audio file")
-
-    options = {
-        "probesize": str(probesize),
-        "analyzeduration": str(analyzeduration_us),
-    }
-    resampler = AudioResampler(format='s16', layout='mono', rate=16000)
-
-    with av.open(file, mode="r", options=options, metadata_encoding="utf-8") as container:
-        aus = container.streams.audio[0]
-        aus.thread_type = "AUTO"
-
-        # 1) Compute seek offset in stream ticks
-        ts = int(start_sec / float(aus.time_base))  # seconds -> ticks
-
-        # 2) Seek to keyframe <= start_sec
-        container.seek(ts, stream=aus, any_frame=False, backward=True)
-
-        # 3) New decode loop; drop until PTS >= start_sec
-
-        chunks = []
-        try:
-            for frame in container.decode(audio=0):
-                # Resample to desired SR/mono/PCM16; result can be a frame or list of frames
-                res = resampler.resample(frame)
-                frames = res if isinstance(res, (list, tuple)) else [res]
-
-                for f in frames:
-                    arr = f.to_ndarray()  # typically (channels, samples) or (samples,)
-
-                    # Flatten to 1-D mono
-                    if arr.ndim == 2:
-                        # (1, N) or (N, 1) → (N,)
-                        if arr.shape[0] == 1:
-                            arr = arr[0]
-                        elif arr.shape[1] == 1:
-                            arr = arr[:, 0]
-                        else:
-                            # Unexpected multi-channel after mono resample: average as fallback
-                            arr = arr.mean(axis=0)
-                    elif arr.ndim > 2:
-                        arr = arr.reshape(-1)
-
-                    # Convert PCM16 → float32 in [-1, 1]
-                    if arr.dtype != np.float32:
-                        arr = (arr.astype(np.float32) / 32768.0).clip(-1.0, 1.0)
-
-                    chunks.append(arr)
-        finally:
-            container.close()
-
-    if not chunks:
-        return np.zeros((0,), dtype=np.float32)
-
-    audio = np.concatenate(chunks, axis=0).astype(np.float32, copy=False)
-    return audio
-
 
 # Clip Segmentation -----------------------------------
 
@@ -498,14 +434,19 @@ def main(uri: str, row_limit: int, B: int, T: int, W: int, H: int, interp: str =
     df3.limit(row_limit).collect()
     print(f"  took {time.time() - t0:.2f}s")
 
-    print(f"Total time: {time.time() - start:.2f}s")
-    return {"read_video_frames": df1, "pyav_full": df2, "seek_plan": df3}
+
 
 
 
 if __name__ == "__main__":
     uri = "../videoprism/videoprism/assets/*.mp4"
-    _ = main(uri, row_limit=10, B=2, T=16, W=288, H=288, interp=None)
+    B, T, H, W, C = 2, 16, 288, 288, 3 # Batch Size, Clip Size (# frames), Height, Width, RGB
+    ROW_LIMIT = 500
+
+    start = time.time()
+    df = main(uri, row_limit=ROW_LIMIT, B=B, T=T, W=W, H=H, interp=None)
+
+    print(f"Time taken: {time.time() - start:.2f}s")
 
 
-   
+    df.show()

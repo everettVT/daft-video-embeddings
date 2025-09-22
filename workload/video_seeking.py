@@ -1,5 +1,5 @@
 import daft
-from daft import col, DataType as dt
+from daft import col, DataType as dt, File
 from daft.functions import file
 import av
 import time
@@ -7,9 +7,7 @@ import numpy as np
 from dataclasses import dataclass
 from fractions import Fraction
 
-
-
-
+    
 
 @daft.func(return_dtype = dt.struct({
     "width": dt.int32(),
@@ -18,10 +16,8 @@ from fractions import Fraction
     "duration": dt.float64(),
     "frame_count": dt.int32(),
     "time_base": dt.float64(),
-    "keyframe_pts": dt.list(dt.float64()),
-    "keyframe_indices": dt.list(dt.int32()),
 }))
-def fetch_video_metadata(
+def fetch_meta(
     file: daft.File,
     *,
     probesize: str = "64k",
@@ -40,7 +36,7 @@ def fetch_video_metadata(
         "analyzeduration": str(analyzeduration_us),
     }
 
-    with av.open(file,mode="r", options=options, metadata_encoding="utf-8") as container:
+    with av.open(file, mode="r", options=options, metadata_encoding="utf-8") as container:
         video = next(
             (stream for stream in container.streams if stream.type == "video"),
             None,
@@ -85,7 +81,49 @@ def fetch_video_metadata(
             else:
                 frame_count = None
 
-        # Keyframes -----------------------
+        return {
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "duration": duration,
+            "frame_count": frame_count,
+            "time_base": time_base
+        }
+
+
+@daft.func(return_dtype=dt.struct({
+    "index": dt.uint64(),
+    "pts": dt.float64(),
+}))
+def key_frames(
+    file: daft.File,
+    *,
+    probesize: str = "64k",
+    analyzeduration_us: int = 200_000,
+) -> list[float]:
+
+    options = {
+            "probesize": str(probesize),
+            "analyzeduration": str(analyzeduration_us),
+        }
+
+    with av.open(file,mode="r", options=options, metadata_encoding="utf-8") as container:
+        video = next(
+            (stream for stream in container.streams if stream.type == "video"),
+            None,
+        )
+        if video is None:
+            return {
+                "index": [],
+                "pts": [],
+            }
+
+        fps = None
+        if video.average_rate:
+            fps = float(video.average_rate)
+        elif video.guessed_rate:
+            fps = float(video.guessed_rate)
+
         keyframe_pts = []
         try:
             for packet in container.demux(video):
@@ -100,35 +138,11 @@ def fetch_video_metadata(
         )
 
         return {
-            "width": width,
-            "height": height,
-            "fps": fps,
-            "duration": duration,
-            "frame_count": frame_count,
-            "time_base": time_base,
-            "keyframe_pts": keyframe_pts,
-            "keyframe_indices": keyframe_indices,
+            "index": keyframe_indices,
+            "pts": keyframe_pts,
         }
 
-@dataclass
-class _MultiStreamVideoFrame:
-    """Represents a single video frame.
 
-    Note:
-        The field name 'data' is required due to a casting bug.
-        See: https://github.com/Eventual-Inc/Daft/issues/4872
-    """
-
-    path: str
-    stream_index: int
-    frame_time_ns: int
-    frame_time: float
-    frame_time_base: Fraction
-    frame_pts: int
-    frame_dts: int | None
-    frame_duration: int | None
-    is_key_frame: bool
-    data: np.ndarray
 
 def select_stream_by_index(container: av.container.input.InputContainer, stream_index: int) -> av.video.stream.VideoStream:
     vs = container.streams.video[stream_index]
@@ -211,6 +225,10 @@ def seek_video_frames(
             if width and height:
                 frame = frame.reformat(width=width, height=height)
 
+            payload = frame.to_ndarray(format="rgb24").tobytes()
+            payload_size_bytes = len(payload)
+            
+
             yield {
                 "path": str(file),
                 "stream_index": int(vs.index),
@@ -221,7 +239,8 @@ def seek_video_frames(
                 "frame_dts": float(frame.dts) if frame.dts is not None else float("nan"),
                 "frame_duration": float(frame.duration) if frame.duration is not None else float("nan"),
                 "is_key_frame": bool(frame.key_frame),
-                "data": frame.to_ndarray(format="rgb24").tobytes(),
+                "payload": payload,
+                "payload_size_bytes": payload_size_bytes,
             }
 
 
@@ -247,7 +266,6 @@ def linspace(start: float, end: float, num: int):
 
 
 def main(uri: str, seek_duration: float, num_batches: int, B: int, T: int, W: int, H: int):
-    start = time.time()
 
     for i in range(num_batches):
         df = (
@@ -326,7 +344,6 @@ if __name__ == "__main__":
         col("frames")["data"].image.decode(daft.ImageMode.RGB).alias("image"),
 
     )
-
 
     print(f"Time taken: {time.time() - start:.2f}s")
 
