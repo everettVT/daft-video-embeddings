@@ -1,24 +1,24 @@
 # Video Embeddings
 
-Date: Aug 25, 2025
-Author: Everett Kleven
-Size: L
-Persona: UDF Naive User
+- Date: Aug 25, 2025
+- Author: Everett Kleven
+- Size: L
+- Persona: VideoType Discussion Participant
+
+
 Notebooks:
-- from_video_frames to video embeddings
-- end to end video processing from file
+  - from_video_frames to video embeddings
+  - end to end video processing from file
 
 Scripts: 
 
+## Abstract
 
-## Purpose
+Video processing is the next frontier for multimodal ai workloads. Video combines image, audio, and temporal data into a single file, which when read together, quickly exhaust in-memoryu resources. Most processing strategies leverage streaming to minimize memory overhead contrasting with traditional ETL pipelines.
 
-Explore friction points in video ai pipelines including: 
 
-1.  Exploring what it looks like if it's prohibitive to load all frames into memory
-2. Reading Audio from videos and using timestamped transcription for segmentation
-3. Image Embedding based shot boundary detection
-4. Video Embeddings for Video Understanding
+
+
 
 ## Overview
 
@@ -37,23 +37,27 @@ Video Data Functions and UDFs
 - splitting videos by key frames, as *split_video()*
 - extracting audio, as *audio()*
 
-In addition to these key concerns within the community, I also explored: 
+In addition to these focus areas, I also explored friction points in video ai pipelines such as: 
 
 - generating embeddings for images, audio, and video using google/embedding-gemma, nvidia/parakeet, and google/videoprism respectively.
 - shot boundary detection using embeddings (keyframe detection for video segmentation)
 - concurrent reads with video seeking.
-- Extract keyframe pts, batch on predined duration with predefined sizing. 
+- Extract keyframe pts, batch on predined duration with predefined sizing.
+
+
+1.  Exploring what it looks like if it's prohibitive to load all frames into memory
+2. Reading Audio from videos and using timestamped transcription for segmentation
+3. Image Embedding based shot boundary detection
+4. Video Embeddings for Video Understanding
+
 
 ## Summary
 
 Video processing is hard.
 
+`read_video_frames()` is convenient and well built, but could use some enrichment.  use case of reading images to a row limit and generating video embeddings on 16 frame clips, I was able to get the happy path working within a few work sessions. Once I faced the prospect of video segmentation and seeking to concurrently read videos with daft.File things became more complicated.
 
-## Actual Summary
-
- `read_video_frames()` is convenient, but insufficient. For the naive use case of reading images to a row limit and generating video embeddings on 16 frame clips, I was able to get the happy path working within a few work sessions. Once I faced the prospect of video segmentation and seeking to concurrently read videos with daft.File things became more complicated.
-
-Or at least, I thought they were. I spent several frustrated days trying to implement shot boundary detection (SBD). Luckily, window functions collapses into a fully daft native pipeline, so long as you are ok with reading all video data sequentially with a read_video_frames.
+Window functions collapses into a fully daft native pipeline, so long as you are ok with reading all video data sequentially with a read_video_frames.
 
 What makes video processing particularly complex isn't just memory management, but the number of early decisions an engineer has to commit to when designing their workload. While my particular workload of video embeddings is straightforward, if I were building the pipeline for a more specific downstream task, I may implement things very differently.
 
