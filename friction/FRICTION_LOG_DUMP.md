@@ -13,14 +13,51 @@ Scripts:
 
 ## Purpose
 
-Explore friction points in video ai pipelines assuming it is prohibitive to load all frames into memory.
+Explore friction points in video ai pipelines including: 
 
+1.  Exploring what it looks like if it's prohibitive to load all frames into memory
+2. Reading Audio from videos and using timestamped transcription for segmentation
+3. Image Embedding based shot boundary detection
+4. Video Embeddings for Video Understanding
+
+## Overview
+
+This week I focused on the pains expressed in the [VideoType discussion](https://github.com/Eventual-Inc/Daft/discussions/5054), namely:
+
+VideoType Pipelines should:
+
+- avoid storing the entire dataset in memory
+- it is critical to extract key metadata to facilitate subsequent filtering of target videos prior to processing
+- prioritize including only essential metadata fields—specifically frame count, height, width, and FPS
+- Additional metadata can be dynamically retrieved during video processing as needed
+
+Video Data Functions and UDFs
+
+- extracting key frames, as *key_frames()*
+- splitting videos by key frames, as *split_video()*
+- extracting audio, as *audio()*
+
+In addition to these key concerns within the community, I also explored: 
+
+- generating embeddings for images, audio, and video using google/embedding-gemma, nvidia/parakeet, and google/videoprism respectively.
+- shot boundary detection using embeddings (keyframe detection for video segmentation)
+- concurrent reads with video seeking.
+- Extract keyframe pts, batch on predined duration with predefined sizing. 
 
 ## Summary
 
-Video processing is hard. My experience echoed similar pains to that of the [VideoType discussion](https://github.com/Eventual-Inc/Daft/discussions/5054), where `read_video_frames()` is convenient, but insufficient. For the naive use case of reading images to a row limit and generating video embeddings on 16 frame clips, I was able to get the happy path working within a few work sessions. Once I faced the prospect of video segmentation and seeking to concurrently read videos with daft.File things became much more complicated.
+Video processing is hard.
+
+
+## Actual Summary
+
+ `read_video_frames()` is convenient, but insufficient. For the naive use case of reading images to a row limit and generating video embeddings on 16 frame clips, I was able to get the happy path working within a few work sessions. Once I faced the prospect of video segmentation and seeking to concurrently read videos with daft.File things became more complicated.
+
+Or at least, I thought they were. I spent several frustrated days trying to implement shot boundary detection (SBD). Luckily, window functions collapses into a fully daft native pipeline, so long as you are ok with reading all video data sequentially with a read_video_frames.
 
 What makes video processing particularly complex isn't just memory management, but the number of early decisions an engineer has to commit to when designing their workload. While my particular workload of video embeddings is straightforward, if I were building the pipeline for a more specific downstream task, I may implement things very differently.
+
+Streaming frames from a generator represents a fundamentally different mindset from traditinoal ETL pipelines. Sure we can limit the number of rows we receive, but defining the actual mechanism of throttling memory overhead is 
 
 It can be overwhelming to consider the various permutations of video processing approaches, especially concerning ingestion and segmentation. Inference is where the problem becomes more concrete, but if you have multiple downstream AI/ML tasks with different batching requirements things can get hairy quickly. This leads us to wan't to canonicalize our preprocessing stages into a standard form that can then be repackaged and shaped downstream. 
 
