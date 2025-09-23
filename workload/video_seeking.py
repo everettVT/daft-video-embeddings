@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from fractions import Fraction
 
     
-
 @daft.func(return_dtype = dt.struct({
     "width": dt.int32(),
     "height": dt.int32(),
@@ -227,7 +226,7 @@ def seek_video_frames(
 
             payload = frame.to_ndarray(format="rgb24").tobytes()
             payload_size_bytes = len(payload)
-            
+        
 
             yield {
                 "path": str(file),
@@ -271,7 +270,7 @@ def main(uri: str, seek_duration: float, num_batches: int, B: int, T: int, W: in
         df = (
             daft.from_glob_path(uri)
             .with_column("file", file(col("path")))
-            .with_column("meta", fetch_video_metadata(col("file")))
+            .with_column("meta", fetch_meta(col("file")))
             .with_column("duration", col("meta")["duration"])
             .with_column("starts", 
                 linspace(0.0, col("meta")["duration"], col("meta")["duration"]//max_video_seek_read_duration)
@@ -307,7 +306,7 @@ if __name__ == "__main__":
     )
     
 
-    df_meta = df_files.with_column("meta", fetch_video_metadata(col("file")))
+    df_meta = df_files.with_column("meta", fetch_meta(col("file")))
    
 
     df_ugh = df_meta.with_column("duration", col("meta")["duration"])

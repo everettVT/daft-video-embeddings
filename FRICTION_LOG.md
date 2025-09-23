@@ -1,171 +1,75 @@
-# Video Embeddings Friction Log (Reorganized)
+# Video Embeddings
 
-**Date**: Aug 25, 2025  
-**Author**: Everett Kleven  
-**Persona**: UDF‑naive user exploring end‑to‑end video pipelines
+- Date: Aug 25, 2025
+- Author: Everett Kleven
+- Size: L
+- Persona: VideoType Discussion Participant
 
-## Executive Summary
 
-- **Video processing is decision-heavy**: Early choices (ingestion, segmentation, batching) shape the entire pipeline. Convenience APIs like `read_video_frames()` are great for demos but insufficient for real workloads needing streaming, seeking, or sequence ops.
-- **Sequence algorithms need ordering guarantees**: Group by `path` → aggregate lists → sort inside list‑UDF is the reliable pattern. Avoid assuming stable row order in distributed settings.
-- **Do work at decode time when possible**: Histograms, SBD diffs, and simple precomputations are cheaper while decoding than after materialization + shuffles.
-- **UDF ergonomics matter**: Image dtypes require explicit normalization; ndarray return typing must be declared with Daft dtypes, not `np.ndarray` hints.
-- **Performance observations**: GPU batching is strong; TPU JAX/XLA can compile huge graphs and OOM unexpectedly if not carefully batched. PyAV beats subprocess for metadata.
+Notebooks:
+  - from_video_frames to video embeddings
+  - end to end video processing from file
 
-## Scope and Goals
+Scripts: 
 
-Explore friction points for video AI pipelines when loading all frames into memory is prohibitive. Build clips (e.g., 16 frames), batch for inference, and evaluate streaming/seek‑based strategies including SBD and audio transcription.
+## Abstract
 
-## Workflows Attempted
+Video processing is the next frontier for multimodal ai workloads. Video combines image, audio, and temporal data into a single file, which when read together, quickly exhaust in-memoryu resources. Most processing strategies leverage streaming to minimize memory overhead contrasting with traditional ETL pipelines.
 
-- **Ingestion modes**
-  - `read_video_frames()` → decode frames as rows with `frame_index`.
-  - `probe_video_metadata()` + `read_video_file(..., hist, sbd, audio)`.
-  - `probe_video_metadata()` + `seek_video_file(..., hist, sbd, audio)` with preplanned frame timestamps for concurrent reads.
-- **Segmentation**
-  - SBD via frame histograms and adjacent diffs; groupby+agg_list patterns for sequence ops; clip assembly (T=16) and batch packing.
-- **Inference**
-  - Stack clips to `(B,T,H,W,C)` for model throughput; pad tails and batches as needed.
-- **JAX/TPU/GPU**
-  - JIT paths on CPU/GPU worked; A100 handled large batch stacks; TPU suffered XLA compile and HBM OOM for larger DF sizes.
-- **Audio (Parakeet)**
-  - Preprocessed audio as `np.ndarray` list; UDF complained when passed a Series rather than `str | np.ndarray | torch.Tensor` per‑row.
-- **File I/O**
-  - `daft.File` exploration; need path extraction for PyAV; successful concurrent seeks across the same file.
-- **Streaming**
-  - Generator attempts from UDFs failed (no `yield` in UDF); pivoted to seek plans and returning lists/structs.
+## Overview
 
-## Detailed Findings & Frictions
+This week I focused on the pains expressed in the [VideoType discussion](https://github.com/Eventual-Inc/Daft/discussions/5054), namely:
 
-### UDF Ergonomics and Data Types
+VideoType Pipelines should:
 
-- **Image dtype → float tensor**: Direct cast fails; use an explicit normalization UDF to `float32` in `[0,1]`.
-- **Return typing**: `@daft.func(return_dtype=...)` is required; Python hint `-> np.ndarray` is not recognized.
-- **Shape discipline**: Models expect `(B,T,H,W,C)`; define clip size `T` and normalization in a single UDF to avoid extra passes.
+- *"avoid storing the entire dataset in memory"*
+- *"it is critical to extract key metadata to facilitate subsequent filtering of target videos prior to processing"*
+- *"prioritize including only essential metadata fields—specifically frame count, height, width, and FPS"*
+- *"Additional metadata can be dynamically retrieved during video processing as needed"*
 
-Minimal recipes:
+Video Data Functions and UDFs
 
-```python
-@daft.func()
-def normalize(image: np.ndarray) -> dt.tensor(dt.float32()):
-    return np.asarray(image).astype(np.float32) / 255.0
-```
+- *key_frames()* - extracting key frames
+- *split_video()* - splitting videos by key frames 
+- *audio()* - extracting audio
 
-```python
-@daft.func(return_dtype=dt.tensor(dt.float32(), shape=(1, 16, 288, 288, 3)))
-def stack_clip(frames: list[np.ndarray], indices: list[int], clip_size: int):
-    order = np.argsort(np.asarray(indices))
-    def to_np(x):
-        return x.to_numpy() if hasattr(x, "to_numpy") else np.asarray(x)
-    frames_sorted = [to_np(frames[i]) for i in order]
-    if len(order) < clip_size:
-        frames_sorted.extend([frames_sorted[-1]] * (clip_size - len(order)))
-    x = np.stack(frames_sorted[:clip_size], axis=0).astype(np.float32) / 255.0
-    return x[None, ...]
-```
+In addition to these focus areas, I also explored friction points in video ai pipelines such as: 
 
-Key errors seen:
+- generating embeddings for images, audio, and video using google/embedding-gemma, nvidia/parakeet, and google/videoprism respectively.
+- shot boundary detection using embeddings (keyframe detection for video segmentation)
+- concurrent reads with video seeking.
+- Extract keyframe pts, batch on predined duration with predefined sizing.
 
-```text
-DaftCoreException: StructArray::new received ... expected child field: List[Float32]
-```
+1. Exploring what it looks like if it's prohibitive to load all frames into memory
+2. Reading Audio from videos and using timestamped transcription for segmentation
+3. Image Embedding based shot boundary detection
+4. Video Embeddings for Video Understanding
 
-```text
-ValueError: Unrecognized Python type ... <class 'numpy.ndarray'>
-```
+## Summary
 
-### Sequence Ops and Ordering
+Video processing is hard.
 
-- **Don’t rely on row order** in distributed groupbys. Use `groupby(path).agg_list([...])`, then sort inside the list‑UDF using the aggregated `frame_index`.
-- **Explode late** to stay vectorized. Keep list columns through sequence transforms; explode only before model inference or when row‑wise outputs are required.
-- **Two‑frame bucketing is brittle**: Edges are missed across bucket boundaries; prefer a single per‑path pass or a join‑based adjacent diff.
+`read_video_frames()` is convenient and well built, but could use some enrichment. 
 
-### Shot Boundary Detection (SBD)
+ use case of reading images to a row limit and generating video embeddings on 16 frame clips, I was able to get the happy path working within a few work sessions. Once I faced the prospect of video segmentation and seeking to concurrently read videos with daft.File things became more complicated.
 
-- **Streaming‑friendly**: Compute histograms and adjacent chi‑squared distances while decoding to avoid heavy shuffles.
-- **Join‑based alternative**: Pre‑sort by (`path`,`frame_index`), self‑join `current ↔ next`, compute distances row‑wise, then group to assign contiguous `shot_id`s (enforce min shot length).
-- **Keyframes are not cuts**: Use codec keyframes only to narrow search windows post coarse pass; they are not semantic boundaries.
-- **Minimum shot length**: Parameterize (e.g., 6–12 frames at working FPS) to suppress flicker.
+Window functions collapses into a fully daft native pipeline, so long as you are ok with reading all video data sequentially with a read_video_frames.
 
-### Streaming vs Frame Materialization
+What makes video processing particularly complex isn't just memory management, but the number of early decisions an engineer has to commit to when designing their workload. While my particular workload of video embeddings is straightforward, if I were building the pipeline for a more specific downstream task, I may implement things very differently.
 
-- **Do early compute at decode**: Histograms, simple transforms, and ordering metadata are cheapest during decode.
-- **Seek plans work**: Multiple seeks into the same file can run concurrently and atomize memory if batching is tuned to inference capacity.
-- **UDF constraints**: No `yield` from UDFs; return lists/structs or move streaming to file‑level ops that aggregate results.
+Streaming frames from a generator represents a fundamentally different mindset from traditinoal ETL pipelines. Sure we can limit the number of rows we receive, but defining the actual mechanism of throttling memory overhead is 
 
-### JAX/TPU/GPU Observations
+It can be overwhelming to consider the various permutations of video processing approaches, especially concerning ingestion and segmentation. Inference is where the problem becomes more concrete, but if you have multiple downstream AI/ML tasks with different batching requirements things can get hairy quickly. This leads us to wan't to canonicalize our preprocessing stages into a standard form that can then be repackaged and shaped downstream. 
 
-- **GPU batching**: A100 handled up to 24 clips × 16 frames with good throughput.
-- **TPU/XLA**: Larger DFs triggered massive program HBM use and OOM during compile; small batch sizes worked, but scaling hit compiler limits.
+### Ingestion 
 
-Excerpt:
+1. read_video_frames - which decodes video frames into images and stores them as rows against a frame index
+2. probe_video_metadata() + read_video_file(...,hist,sbd,audio) - which probes for metadata as a "cheap" pass, enabling early content filtering, then opening the video file with enriched inputs for extracting image histograms, shot boundary flag, and audio frames. Naturally the audio reading can be broken out into a seperate function entirely, but I'm including it here for brevity.
+3. probe_video_metadata() + seek_video_file(...,hist,sbd,audio) - same as above, except distribute reads reading each video file concurrently from pre-planned frame timestamps.
 
-```text
-XlaRuntimeError: RESOURCE_EXHAUSTED ... Used 55.24G of 31.25G hbm
-```
+### Segementation - Clips & Shot Boundary Detection 
 
-### Audio / Parakeet Integration
+Segmentation in particular presents the problem or chunking your video into semantic pieces. Most downstream ai/ml tasks require samples in clips, usually on the order of 16 frame batches, any operation that occurs outside the clip context requires an additional groupby/explode.
 
-- **Input types**: UDF received a `Series`; Parakeet expects per‑row `str | np.ndarray | torch.Tensor`.
-
-Excerpt:
-
-```text
-ValueError: Input `audio` is of type <class 'daft.series.Series'> ...
-```
-
-### File I/O with `daft.File` and PyAV
-
-- **Path extraction**: Passing `daft.File` directly to PyAV fails; `str(daft.File)` includes a wrapper (`File(file://...)`) that PyAV can’t open. A helper to extract the raw path would remove confusion.
-- **Read/seek/tell**: Minimal docs in class docstrings would help. Once learned, seeking to timestamps unlocked concurrent chunk reads.
-- **PyAV vs subprocess**: PyAV metadata reads were ~10× faster than subprocess calls inside UDFs.
-
-Error examples:
-
-```text
-TypeError: expected str, bytes or os.PathLike object, not PathFile
-```
-
-```text
-FileNotFoundError: ... 'File(file:///Users/everett/Movies/Running.mp4)'
-```
-
-## Practical Recipes
-
-- **Normalize images to float32**: Use a tiny UDF (above). Avoid direct `dt.tensor(float32)` casts from image dtype.
-- **Clip assembly with ordering + padding**: Use `stack_clip` (above). Pass `clip_size` and indices; add a batch dimension.
-- **Adjacent diff without list sorting**: Sort DF by (`path`,`frame_index`), self‑join `lead(frame_index, 1)` semantics via join, compute histogram distances row‑wise, then group to form `shot_id`s and enforce min‑length.
-
-## Actionables for the Daft Team
-
-- **Clarify dtypes**: Boolean dtype naming consistency (`dt.bool` vs `dt.bool_`), document list aggregation column names.
-- **Lead/lag helper**: Provide a simple lead/lag without self‑joins to support sequence ops ergonomically.
-- **Streaming SBD example**: Cookbook for histograms + adjacent diffs + `shot_id` assignment + clip windowing inside shots.
-- **VideoType ergonomics**: Options to compute histograms/SBD/audio during decode; guidance on when to read audio with video.
-- **`daft.File` UX**: Add `to_path()` or similar; docstring hints for read/seek/tell.
-
-## Open Questions
-
-- When is it beneficial to read audio and video together vs separately?
-- Should SBD always be computed during decode, or are relational window functions competitive enough?
-- Best practices for batching with JAX/TPU to avoid XLA OOMs while preserving throughput?
-
-## Appendix: Error Catalog (selected)
-
-```text
-DaftCoreException: StructArray::new ... expected child field: List[Float32]
-```
-
-```text
-ValueError: Unrecognized Python type ... <class 'numpy.ndarray'>
-```
-
-```text
-FileNotFoundError: 'File(file:///...)'
-```
-
-```text
-XlaRuntimeError: RESOURCE_EXHAUSTED: XLA:TPU compile permanent error. Ran out of memory ...
-```
-
-References: VideoType discussion (`https://github.com/Eventual-Inc/Daft/discussions/5054`), Daft examples on images, PyAV docs.
+Shot boundary detection and other video segmentation strategies incentivize early preprocessing during frame decoding at the file level.
+File seeking can help parallelize reads, early computations like histograms and chi-squared distance are more convenient prior to dataframe ingestion. 
